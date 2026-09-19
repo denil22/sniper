@@ -310,23 +310,74 @@ async function main() {
     if (bal < buyAmountWei) warn("buyer balance is below buy amount — top up before the launch fires");
   } catch { /* silent */ }
 
-  // Wallet-centric watcher. Every 100ms per RPC:
-  //   1. eth_getTransactionCount(dev, "pending")   — cheap 1-word call
-  //   2. When the pending nonce JUMPS, dev just sent a tx. Immediately scan the pending mempool
-  //      block AND the latest confirmed block for a tx whose from == dev AND selector matches.
-  //   3. If found and it's a launch, fire.
+  // Wallet-centric watcher. For each RPC we prefer, in order:
+  //   1. txpool_contentFrom(dev)               — geth-style, returns dev's pending txs directly.
+  //                                              ZERO block scan, one call, one tx object.
+  //                                              Requires a private/geth RPC that exposes txpool.
+  //   2. eth_getTransactionCount(dev, "pending") + pending-block scan on jump (fallback).
   //
-  // Watching the wallet's nonce is orders of magnitude cheaper than fetching every block's full
-  // tx list — and hitting the pending block means we can see the launch tx BEFORE it's mined.
-  const stats = httpClients.map(() => ({ pollN: 0, jumpN: 0, errN: 0, lastNonce: -1, lastErr: "" }));
+  // We probe each RPC once at boot to figure out which method it supports.
+  const stats = httpClients.map(() => ({
+    pollN: 0, jumpN: 0, errN: 0, lastNonce: -1, lastErr: "",
+    method: "probing", // "txpool" | "nonce" | "probing"
+  }));
 
-  // Prime each RPC's baseline nonce.
+  async function probeTxpool(client) {
+    try {
+      // Some RPCs return the object, some throw "method not found". We accept any non-throw as success.
+      await client.transport.request({ method: "txpool_contentFrom", params: [devWallet] });
+      return true;
+    } catch { return false; }
+  }
+  // Probe all RPCs in parallel.
+  await Promise.all(httpClients.map(async (client, i) => {
+    const has = await probeTxpool(client);
+    stats[i].method = has ? "txpool" : "nonce";
+  }));
+  const summary = stats.map((s, i) => `${new URL(rpcs[i]).host} → ${s.method}`).join(", ");
+  ok(`RPC capability probe: ${summary}`);
+
+
+  // Prime each RPC's baseline nonce (used by the nonce-jump fallback path).
   await Promise.all(httpClients.map(async (client, i) => {
     try {
       stats[i].lastNonce = await client.getTransactionCount({ address: devWallet, blockTag: "pending" });
     } catch (e) { stats[i].errN++; stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80); }
   }));
   log(`baseline pending nonce for ${devWallet}: ${stats[0].lastNonce}`);
+
+  // txpool_contentFrom returns { pending: {nonce: tx}, queued: {nonce: tx} }.
+  // Match: to == pons factory AND input starts with 0xa72101af. Fires ONE-shot.
+  async function pollTxpool(client, i, label) {
+    stats[i].pollN++;
+    try {
+      const r = await client.transport.request({ method: "txpool_contentFrom", params: [devWallet] });
+      if (!r) return;
+      const buckets = [r.pending, r.queued].filter(Boolean);
+      for (const bucket of buckets) {
+        for (const nonce of Object.keys(bucket)) {
+          const tx = bucket[nonce];
+          if (!tx || seenTxs.has(tx.hash)) continue;
+          if (!isTargetLaunch(tx)) continue;
+          seenTxs.add(tx.hash);
+          stats[i].jumpN++;
+          log(`(${label}) ✔ launch tx in txpool (nonce ${nonce}): ${tx.hash}`);
+          // Wait for receipt (up to 6s) then find curve.
+          let found = null;
+          for (let attempt = 0; attempt < 60 && !found; attempt++) {
+            found = await findLaunchedCurve(client, tx.hash).catch(() => null);
+            if (!found) await new Promise((rr) => setTimeout(rr, 100));
+          }
+          if (!found) { warn(`could not resolve curve for ${tx.hash} — timed out`); continue; }
+          await fire(found.curve, tx.hash);
+          return;
+        }
+      }
+    } catch (e) {
+      stats[i].errN++;
+      stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80);
+    }
+  }
 
   async function onNonceJump(client, i, oldN, newN, label) {
     log(`(${label}) nonce jump ${oldN} → ${newN} — dev sent ${newN - oldN} tx, hunting launch call…`);
@@ -360,8 +411,13 @@ async function main() {
   }
 
   httpClients.forEach((client, i) => {
-    const label = `rpc#${i}`;
+    const label = `rpc#${i}(${stats[i].method})`;
     setInterval(async () => {
+      if (stats[i].method === "txpool") {
+        await pollTxpool(client, i, label);
+        return;
+      }
+      // Nonce-jump fallback for RPCs without txpool.
       stats[i].pollN++;
       try {
         const nonce = await client.getTransactionCount({ address: devWallet, blockTag: "pending" });
@@ -369,7 +425,7 @@ async function main() {
           const old = stats[i].lastNonce;
           stats[i].lastNonce = nonce;
           stats[i].jumpN++;
-          onNonceJump(client, i, old, nonce, label); // fire and forget
+          onNonceJump(client, i, old, nonce, label);
         }
       } catch (e) {
         stats[i].errN++;
@@ -386,7 +442,7 @@ async function main() {
     const lines = stats.map((st, i) => {
       const url = new URL(rpcs[i]).host;
       const errTail = st.errN > 0 ? ` err=${st.errN} (${st.lastErr})` : "";
-      return `  ${url.padEnd(40)}  polls=${st.pollN}  jumps=${st.jumpN}  nonce=${st.lastNonce}${errTail}`;
+      return `  ${url.padEnd(40)}  [${st.method}]  polls=${st.pollN}  hits=${st.jumpN}  nonce=${st.lastNonce}${errTail}`;
     }).join("\n");
     log(`— heartbeat —\n${lines}`);
   }, 5000);
