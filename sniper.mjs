@@ -26,7 +26,12 @@ import { privateKeyToAccount } from "viem/accounts";
 // ─── constants ──────────────────────────────────────────────────────────────
 const CHAIN_ID = 4663;
 const PONS_FACTORY = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e";
-const PONS_LAUNCH_SELECTOR = "0xa72101af";
+// pons's launchForwarder — their frontend routes launches through this contract, which then
+// internally calls the factory. Verified on-chain from tx 0xac325885… (user launch via forwarder).
+const PONS_LAUNCH_FORWARDER = "0xe33E9E479dF8802cb0866d5d05258bEc4cF62948";
+const PONS_LAUNCH_SELECTOR = "0xa72101af"; // canonical direct-factory launchToken sig
+// Set of "any of these is a launch entrypoint" — checked case-insensitively.
+const LAUNCH_TARGETS = new Set([PONS_FACTORY.toLowerCase(), PONS_LAUNCH_FORWARDER.toLowerCase()]);
 const POLL_MS = 50;             // dev-nonce poll cadence per RPC
 const RECEIPT_POLL_MS = 20;     // how fast we hammer the receipt lookup once we see the launch
 const RECEIPT_MAX_MS = 3000;    // give up chasing a receipt after this many ms
@@ -168,12 +173,11 @@ let fired = false;
 const seenTxs = new Set(); // dedupe across all RPCs
 const factoryLower = PONS_FACTORY.toLowerCase();
 
-// A tx is a "launch candidate" if from == dev AND to == pons factory. We don't require the
-// selector to be 0xa72101af any more — pons could rev their factory, or the user could route
-// through a proxy. Any factory call from the dev is worth chasing.
+// A tx is a "launch candidate" if from == dev AND to is either the pons factory OR the pons
+// launchForwarder. Pons's UI routes launches through the forwarder — direct factory calls also work.
 function isTargetLaunch(tx) {
   if (!tx || !tx.hash || !tx.to || !tx.input) return false;
-  if (tx.to.toLowerCase() !== factoryLower) return false;
+  if (!LAUNCH_TARGETS.has(tx.to.toLowerCase())) return false;
   if ((tx.from || "").toLowerCase() !== devWallet) return false;
   return true;
 }
@@ -188,9 +192,13 @@ async function findLaunchedCurve(client, txHash) {
   const receipt = await client.getTransactionReceipt({ hash: txHash });
   if (!receipt || receipt.status !== "success") return null;
 
+  // Collect every 20-byte address-shaped candidate from EVERY log in the receipt — topics + data
+  // words + the log.address itself. Whichever one answers `.curve()` is the token, and the answer
+  // is its curve. Widened because pons launches route through the forwarder + factory + token +
+  // curve — the interesting addresses can appear in any of their events.
   const seen = new Set();
   for (const l of receipt.logs) {
-    if (l.address.toLowerCase() !== factoryLower) continue;
+    if (l.address) seen.add(l.address.toLowerCase());
     for (const t of l.topics) {
       if (typeof t === "string" && t.length === 66) {
         seen.add("0x" + t.slice(-40).toLowerCase());
@@ -204,6 +212,10 @@ async function findLaunchedCurve(client, txHash) {
     }
   }
   seen.delete(ZERO);
+  // Skip known infra addresses — they aren't the token.
+  seen.delete(factoryLower);
+  seen.delete(PONS_LAUNCH_FORWARDER.toLowerCase());
+  seen.delete(devWallet);
 
   for (const candidate of seen) {
     try {
