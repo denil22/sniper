@@ -382,13 +382,21 @@ async function main() {
   async function onNonceJump(client, i, oldN, newN, label) {
     log(`(${label}) nonce jump ${oldN} → ${newN} — dev sent ${newN - oldN} tx, hunting launch call…`);
     // Try pending block first (unmined mempool). Then latest confirmed. Whichever finds it wins.
+    // If we find a tx from dev that ISN'T a launchToken, log it so the user can debug.
+    let sawAnyDevTx = false;
     for (const tag of ["pending", "latest"]) {
       try {
         const block = await client.getBlock({ blockTag: tag, includeTransactions: true });
         for (const tx of block.transactions || []) {
           if (typeof tx === "string") continue;
+          if ((tx.from || "").toLowerCase() !== devWallet) continue;
+          sawAnyDevTx = true;
           if (seenTxs.has(tx.hash)) continue;
-          if (!isTargetLaunch(tx)) continue;
+          if (!isTargetLaunch(tx)) {
+            log(`(${label}) dev tx in ${tag} block is NOT a launchToken — to=${tx.to} sel=${(tx.input || "0x").slice(0, 10)} hash=${tx.hash}`);
+            seenTxs.add(tx.hash);
+            continue;
+          }
           seenTxs.add(tx.hash);
           log(`(${label}) ✔ launch tx in ${tag} block: ${tx.hash}`);
 
@@ -407,6 +415,11 @@ async function main() {
         stats[i].errN++;
         stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80);
       }
+    }
+    if (!sawAnyDevTx) {
+      warn(`(${label}) nonce jumped but dev's tx wasn't in pending or latest block — RPC may be lagging. Retrying next poll.`);
+      // Roll back so next poll retries; guarantees we don't miss a slow-to-propagate launch.
+      stats[i].lastNonce = oldN;
     }
   }
 
