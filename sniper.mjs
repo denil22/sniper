@@ -310,21 +310,38 @@ async function main() {
     if (bal < buyAmountWei) warn("buyer balance is below buy amount — top up before the launch fires");
   } catch { /* silent */ }
 
-  // Kick off pollers — one per HTTP RPC at POLL_MS. All race.
+  // Per-RPC health/telemetry. Heartbeat prints every 5s so the user knows it's alive.
+  const stats = httpClients.map(() => ({ pollN: 0, blockN: 0, errN: 0, lastBlock: 0n, lastErr: "" }));
+
   httpClients.forEach((client, i) => {
     const label = `rpc#${i}`;
-    let lastBlock = 0n;
     setInterval(async () => {
+      stats[i].pollN++;
       try {
         const block = await client.getBlock({ blockTag: "latest", includeTransactions: true });
-        if (block.number <= lastBlock) return;
-        lastBlock = block.number;
+        if (block.number <= stats[i].lastBlock) return;
+        stats[i].blockN++;
+        stats[i].lastBlock = block.number;
         await scanBlock(client, block, label);
-      } catch { /* silent — one flaky RPC won't spam logs */ }
+      } catch (e) {
+        stats[i].errN++;
+        stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80);
+      }
     }, POLL_MS);
   });
 
-  ok(`polling ${httpClients.length} HTTPS RPCs @ ${POLL_MS}ms — waiting for launch…`);
+  ok(`polling ${httpClients.length} HTTPS RPCs @ ${POLL_MS}ms — waiting for launch from ${devWallet}…`);
+  log(`(idle mode — will print heartbeat every 5s and only wake up on the launch tx)`);
+
+  // Heartbeat every 5s: show that we're alive, on which block, with any RPC errors.
+  setInterval(() => {
+    const lines = stats.map((st, i) => {
+      const url = new URL(rpcs[i]).host;
+      const errTail = st.errN > 0 ? ` err=${st.errN} (${st.lastErr})` : "";
+      return `  ${url.padEnd(40)}  polls=${st.pollN}  newBlocks=${st.blockN}  latest=${st.lastBlock}${errTail}`;
+    }).join("\n");
+    log(`— heartbeat —\n${lines}`);
+  }, 5000);
 }
 
 main().catch((e) => { err(String(e.stack || e)); process.exit(1); });
