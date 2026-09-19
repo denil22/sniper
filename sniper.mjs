@@ -24,20 +24,21 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 
 // ─── constants ──────────────────────────────────────────────────────────────
+import {
+  PONS_FACTORY, PONS_LAUNCH_FORWARDER, PONS_LAUNCH_SELECTOR,
+  LAUNCH_TARGETS, ZERO,
+  isTargetLaunch as isTargetLaunchLib,
+  isCanonicalLaunchSelector as isCanonicalLaunchSelectorLib,
+  candidateAddressesFromReceipt, routedVia, encodeCurveBuyData,
+} from "./lib.mjs";
+
 const CHAIN_ID = 4663;
-const PONS_FACTORY = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e";
-// pons's launchForwarder — their frontend routes launches through this contract, which then
-// internally calls the factory. Verified on-chain from tx 0xac325885… (user launch via forwarder).
-const PONS_LAUNCH_FORWARDER = "0xe33E9E479dF8802cb0866d5d05258bEc4cF62948";
-const PONS_LAUNCH_SELECTOR = "0xa72101af"; // canonical direct-factory launchToken sig
-// Set of "any of these is a launch entrypoint" — checked case-insensitively.
-const LAUNCH_TARGETS = new Set([PONS_FACTORY.toLowerCase(), PONS_LAUNCH_FORWARDER.toLowerCase()]);
-const POLL_MS = 50;             // dev-nonce poll cadence per RPC
-const RECEIPT_POLL_MS = 20;     // how fast we hammer the receipt lookup once we see the launch
-const RECEIPT_MAX_MS = 3000;    // give up chasing a receipt after this many ms
+const POLL_MS = 50;              // dev-nonce poll cadence per RPC
+const RECEIPT_POLL_MS = 20;      // hammer the receipt lookup once we see the launch
+const RECEIPT_MAX_MS = 500;      // give up chasing a receipt after this many ms
+const HEARTBEAT_MS = 1000;       // show it's alive every second
 const GAS_GWEI = 1n;
 const GAS_WEI = GAS_GWEI * 1_000_000_000n; // maxFee + priority both = 1 gwei
-const ZERO = "0x0000000000000000000000000000000000000000";
 const CURVE_BUY_ABI = [{
   type: "function", name: "buy", stateMutability: "payable",
   inputs: [{ type: "uint256" }, { type: "uint256" }, { type: "address" }],
@@ -173,51 +174,17 @@ let fired = false;
 const seenTxs = new Set(); // dedupe across all RPCs
 const factoryLower = PONS_FACTORY.toLowerCase();
 
-// A tx is a "launch candidate" if from == dev AND to is either the pons factory OR the pons
-// launchForwarder. Pons's UI routes launches through the forwarder — direct factory calls also work.
-function isTargetLaunch(tx) {
-  if (!tx || !tx.hash || !tx.to || !tx.input) return false;
-  if (!LAUNCH_TARGETS.has(tx.to.toLowerCase())) return false;
-  if ((tx.from || "").toLowerCase() !== devWallet) return false;
-  return true;
-}
-// Optional stricter check that matches ONLY the canonical launchToken selector.
-function isCanonicalLaunchSelector(tx) {
-  return (tx.input || "0x").slice(0, 10).toLowerCase() === PONS_LAUNCH_SELECTOR;
-}
+// Local wrappers that inject the current devWallet — logic lives in lib.mjs and is unit-tested.
+const isTargetLaunch = (tx) => isTargetLaunchLib(tx, devWallet);
+const isCanonicalLaunchSelector = (tx) => isCanonicalLaunchSelectorLib(tx);
 
-// Extract the launched curve from a launch-tx receipt: scan every factory log's topics + data
-// words for 20-byte address candidates, then call `.curve()` on each — the one that answers wins.
+// Extract the launched curve from a launch-tx receipt: scan every log for address candidates via
+// lib.candidateAddressesFromReceipt, then call `.curve()` on each — first to answer wins.
 async function findLaunchedCurve(client, txHash) {
   const receipt = await client.getTransactionReceipt({ hash: txHash });
   if (!receipt || receipt.status !== "success") return null;
-
-  // Collect every 20-byte address-shaped candidate from EVERY log in the receipt — topics + data
-  // words + the log.address itself. Whichever one answers `.curve()` is the token, and the answer
-  // is its curve. Widened because pons launches route through the forwarder + factory + token +
-  // curve — the interesting addresses can appear in any of their events.
-  const seen = new Set();
-  for (const l of receipt.logs) {
-    if (l.address) seen.add(l.address.toLowerCase());
-    for (const t of l.topics) {
-      if (typeof t === "string" && t.length === 66) {
-        seen.add("0x" + t.slice(-40).toLowerCase());
-      }
-    }
-    if (l.data && l.data.length > 2) {
-      const d = l.data.slice(2);
-      for (let i = 24; i + 40 <= d.length; i += 64) {
-        seen.add("0x" + d.slice(i, i + 40).toLowerCase());
-      }
-    }
-  }
-  seen.delete(ZERO);
-  // Skip known infra addresses — they aren't the token.
-  seen.delete(factoryLower);
-  seen.delete(PONS_LAUNCH_FORWARDER.toLowerCase());
-  seen.delete(devWallet);
-
-  for (const candidate of seen) {
+  const candidates = candidateAddressesFromReceipt(receipt, devWallet);
+  for (const candidate of candidates) {
     try {
       const curve = await client.readContract({
         address: candidate, abi: TOKEN_ABI, functionName: "curve",
@@ -273,7 +240,7 @@ async function fire(curveAddr, sourceHash) {
     const nonce = await client.getTransactionCount({ address: buyer, blockTag: "pending" });
     const request = await walletClient.prepareTransactionRequest({
       to: curveAddr,
-      data: encodeCurveBuyData(args),
+      data: encodeCurveBuyData(...args),
       value: buyAmountWei,
       gas: gasLimit,
       maxFeePerGas: GAS_WEI,
@@ -314,15 +281,6 @@ async function fire(curveAddr, sourceHash) {
   process.exit(0);
 }
 
-// Local calldata encoder for curve.buy(uint256, uint256, address) — avoids a round-trip.
-function encodeCurveBuyData([quoteIn, minTokensOut, recipient]) {
-  const sel = "0x59a87bc1"; // buy(uint256,uint256,address) — pons v2 canonical selector
-  const pad = (h) => h.replace(/^0x/, "").padStart(64, "0");
-  const qIn = pad(quoteIn.toString(16));
-  const mIn = pad(minTokensOut.toString(16));
-  const rec = pad(recipient.slice(2).toLowerCase());
-  return sel + qIn + mIn + rec;
-}
 
 async function scanBlock(client, block, sourceLabel) {
   const txs = block?.transactions || [];
@@ -464,12 +422,12 @@ async function main() {
             continue; // dev txed to something else — not a launch
           }
           sawAnyToLaunchTarget = true;
-          const routedVia = to === factoryLower ? "factory" : "forwarder";
+          const via = routedVia(to);
           if (to === factoryLower && !isCanonicalLaunchSelector(tx)) {
             log(`(${label}) ↳ selector ${sel} isn't the known launchToken selector (${PONS_LAUNCH_SELECTOR}) — chasing anyway`);
           }
           seenTxs.add(tx.hash);
-          log(`(${label}) ✔ dev→${routedVia} tx: ${tx.hash} — resolving curve…`);
+          log(`(${label}) ✔ dev→${via} tx: ${tx.hash} — resolving curve…`);
 
           // Hammer the receipt across ALL RPCs in parallel (first-wins) at RECEIPT_POLL_MS.
           const t0 = Date.now();
@@ -533,7 +491,7 @@ async function main() {
       return `  ${url.padEnd(40)}  [${st.method}]  polls=${st.pollN}  hits=${st.jumpN}  nonce=${st.lastNonce}${errTail}`;
     }).join("\n");
     log(`— heartbeat —\n${lines}`);
-  }, 5000);
+  }, HEARTBEAT_MS);
 }
 
 main().catch((e) => { err(String(e.stack || e)); process.exit(1); });

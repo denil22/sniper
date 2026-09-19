@@ -5,7 +5,8 @@
   "type": "module",
   "bin": { "pons-sniper": "./sniper.mjs" },
   "scripts": {
-    "start": "node sniper.mjs config.json"
+    "start": "node sniper.mjs",
+    "test": "node --test test.mjs"
   },
   "dependencies": {
     "viem": "^2.21.0"
