@@ -1,0 +1,13 @@
+{
+  "name": "pons-sniper",
+  "version": "1.0.0",
+  "description": "Multi-RPC pons v2 launch sniper — watches a dev wallet, fires a direct curve.buy() from a single hot wallet on launch",
+  "type": "module",
+  "bin": { "pons-sniper": "./sniper.mjs" },
+  "scripts": {
+    "start": "node sniper.mjs config.json"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  }
+}
