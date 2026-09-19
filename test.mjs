@@ -178,6 +178,19 @@ test("encodeCurveBuyData: zero args produce all zeros after selector", () => {
   assert.equal(data, "0x59a87bc1" + "0".repeat(64 * 3));
 });
 
+test("encodeCurveBuyData: returns EXACTLY one leading 0x — never double-prefixed (regression)", () => {
+  // Bug that bit us: caller wrote `"0x" + encodeCurveBuyData(...)`, producing "0x0x59a87bc1..."
+  // which viem's hex parser rejected with "Invalid byte sequence". This test locks in that
+  // encodeCurveBuyData is directly usable as a viem `data` field WITHOUT any extra prefixing.
+  const data = encodeCurveBuyData(5_000_000_000_000_000n, 0n, "0x1111111111111111111111111111111111111111");
+  assert.ok(data.startsWith("0x"), "must start with 0x");
+  assert.ok(!data.startsWith("0x0x"), "must not double-prefix");
+  // Must be a valid hex string throughout
+  assert.match(data, /^0x[0-9a-f]+$/i, "must be pure lowercase hex after 0x");
+  // Length must be exactly 2 + 8 selector + 3*64 args = 202
+  assert.equal(data.length, 2 + 8 + 3 * 64);
+});
+
 // ─── candidatesFromSimulation ───────────────────────────────────────────────
 // pons's launchToken returns (address token, address curve). Simulation via eth_call gives us
 // the packed return data. We must extract both addresses without waiting for the tx to mine.

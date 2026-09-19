@@ -267,9 +267,10 @@ async function fire(curveAddr, sourceHash) {
     const nonce = buyerNonce;
     buyerNonce = nonce + 1; // increment optimistically; roll back on failure
 
+    // encodeCurveBuyData already returns a 0x-prefixed hex string. Do NOT prepend another "0x".
     const request = {
       to: curveAddr,
-      data: "0x" + encodeCurveBuyData(buyAmountWei, minOut, buyer),
+      data: encodeCurveBuyData(buyAmountWei, minOut, buyer),
       value: buyAmountWei,
       gas: gasLimit,
       maxFeePerGas: GAS_WEI,
