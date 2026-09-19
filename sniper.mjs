@@ -27,7 +27,7 @@ import { privateKeyToAccount } from "viem/accounts";
 const CHAIN_ID = 4663;
 const PONS_FACTORY = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e";
 const PONS_LAUNCH_SELECTOR = "0xa72101af";
-const POLL_MS = 50;
+const POLL_MS = 100;
 const GAS_GWEI = 1n;
 const GAS_WEI = GAS_GWEI * 1_000_000_000n; // maxFee + priority both = 1 gwei
 const ZERO = "0x0000000000000000000000000000000000000000";
@@ -310,19 +310,67 @@ async function main() {
     if (bal < buyAmountWei) warn("buyer balance is below buy amount — top up before the launch fires");
   } catch { /* silent */ }
 
-  // Per-RPC health/telemetry. Heartbeat prints every 5s so the user knows it's alive.
-  const stats = httpClients.map(() => ({ pollN: 0, blockN: 0, errN: 0, lastBlock: 0n, lastErr: "" }));
+  // Wallet-centric watcher. Every 100ms per RPC:
+  //   1. eth_getTransactionCount(dev, "pending")   — cheap 1-word call
+  //   2. When the pending nonce JUMPS, dev just sent a tx. Immediately scan the pending mempool
+  //      block AND the latest confirmed block for a tx whose from == dev AND selector matches.
+  //   3. If found and it's a launch, fire.
+  //
+  // Watching the wallet's nonce is orders of magnitude cheaper than fetching every block's full
+  // tx list — and hitting the pending block means we can see the launch tx BEFORE it's mined.
+  const stats = httpClients.map(() => ({ pollN: 0, jumpN: 0, errN: 0, lastNonce: -1, lastErr: "" }));
+
+  // Prime each RPC's baseline nonce.
+  await Promise.all(httpClients.map(async (client, i) => {
+    try {
+      stats[i].lastNonce = await client.getTransactionCount({ address: devWallet, blockTag: "pending" });
+    } catch (e) { stats[i].errN++; stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80); }
+  }));
+  log(`baseline pending nonce for ${devWallet}: ${stats[0].lastNonce}`);
+
+  async function onNonceJump(client, i, oldN, newN, label) {
+    log(`(${label}) nonce jump ${oldN} → ${newN} — dev sent ${newN - oldN} tx, hunting launch call…`);
+    // Try pending block first (unmined mempool). Then latest confirmed. Whichever finds it wins.
+    for (const tag of ["pending", "latest"]) {
+      try {
+        const block = await client.getBlock({ blockTag: tag, includeTransactions: true });
+        for (const tx of block.transactions || []) {
+          if (typeof tx === "string") continue;
+          if (seenTxs.has(tx.hash)) continue;
+          if (!isTargetLaunch(tx)) continue;
+          seenTxs.add(tx.hash);
+          log(`(${label}) ✔ launch tx in ${tag} block: ${tx.hash}`);
+
+          // If the tx is still pending, we need to wait for the receipt. Give it a 6s window.
+          let found = null;
+          for (let attempt = 0; attempt < 60 && !found; attempt++) {
+            found = await findLaunchedCurve(client, tx.hash).catch(() => null);
+            if (!found) await new Promise((r) => setTimeout(r, 100));
+          }
+          if (!found) { warn(`could not resolve curve for ${tx.hash} — timed out waiting for receipt`); continue; }
+          await fire(found.curve, tx.hash);
+          return;
+        }
+      } catch (e) {
+        // pending block may not be supported by every RPC — that's fine, try next tag
+        stats[i].errN++;
+        stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80);
+      }
+    }
+  }
 
   httpClients.forEach((client, i) => {
     const label = `rpc#${i}`;
     setInterval(async () => {
       stats[i].pollN++;
       try {
-        const block = await client.getBlock({ blockTag: "latest", includeTransactions: true });
-        if (block.number <= stats[i].lastBlock) return;
-        stats[i].blockN++;
-        stats[i].lastBlock = block.number;
-        await scanBlock(client, block, label);
+        const nonce = await client.getTransactionCount({ address: devWallet, blockTag: "pending" });
+        if (nonce > stats[i].lastNonce) {
+          const old = stats[i].lastNonce;
+          stats[i].lastNonce = nonce;
+          stats[i].jumpN++;
+          onNonceJump(client, i, old, nonce, label); // fire and forget
+        }
       } catch (e) {
         stats[i].errN++;
         stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80);
@@ -330,15 +378,15 @@ async function main() {
     }, POLL_MS);
   });
 
-  ok(`polling ${httpClients.length} HTTPS RPCs @ ${POLL_MS}ms — waiting for launch from ${devWallet}…`);
-  log(`(idle mode — will print heartbeat every 5s and only wake up on the launch tx)`);
+  ok(`watching wallet ${devWallet} across ${httpClients.length} HTTPS RPCs @ ${POLL_MS}ms`);
+  log(`(will print heartbeat every 5s; wakes up on any nonce jump)`);
 
-  // Heartbeat every 5s: show that we're alive, on which block, with any RPC errors.
+  // Heartbeat every 5s.
   setInterval(() => {
     const lines = stats.map((st, i) => {
       const url = new URL(rpcs[i]).host;
       const errTail = st.errN > 0 ? ` err=${st.errN} (${st.lastErr})` : "";
-      return `  ${url.padEnd(40)}  polls=${st.pollN}  newBlocks=${st.blockN}  latest=${st.lastBlock}${errTail}`;
+      return `  ${url.padEnd(40)}  polls=${st.pollN}  jumps=${st.jumpN}  nonce=${st.lastNonce}${errTail}`;
     }).join("\n");
     log(`— heartbeat —\n${lines}`);
   }, 5000);
