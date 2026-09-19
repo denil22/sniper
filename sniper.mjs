@@ -27,7 +27,9 @@ import { privateKeyToAccount } from "viem/accounts";
 const CHAIN_ID = 4663;
 const PONS_FACTORY = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e";
 const PONS_LAUNCH_SELECTOR = "0xa72101af";
-const POLL_MS = 100;
+const POLL_MS = 50;             // dev-nonce poll cadence per RPC
+const RECEIPT_POLL_MS = 20;     // how fast we hammer the receipt lookup once we see the launch
+const RECEIPT_MAX_MS = 3000;    // give up chasing a receipt after this many ms
 const GAS_GWEI = 1n;
 const GAS_WEI = GAS_GWEI * 1_000_000_000n; // maxFee + priority both = 1 gwei
 const ZERO = "0x0000000000000000000000000000000000000000";
@@ -237,6 +239,7 @@ async function fire(curveAddr, sourceHash) {
   fired = true;
 
   const client = httpClients[0];
+  const tFire = Date.now();
   log(`── LAUNCH DETECTED ──`);
   log(`  source tx    : ${sourceHash}`);
   log(`  curve        : ${curveAddr}`);
@@ -247,36 +250,66 @@ async function fire(curveAddr, sourceHash) {
   const minOut = await computeMinTokensOut(client, curveAddr);
   const args = [buyAmountWei, minOut, buyer];
 
-  // Gas limit: try estimate, fall back to 400k.
-  let gasLimit;
-  try {
-    gasLimit = await client.estimateContractGas({
-      address: curveAddr, abi: CURVE_BUY_ABI, functionName: "buy",
-      args, value: buyAmountWei, account,
-    });
-    gasLimit = (gasLimit * 130n) / 100n;
-  } catch (e) {
-    warn(`gas estimate failed (${e.shortMessage || e.message}); using 400000`);
-    gasLimit = 400000n;
-  }
-  log(`  gasLimit     : ${gasLimit}`);
+  // Skip gas estimation for speed — use a fat default. Estimation adds ~50-100ms of RPC time
+  // that we don't have when we're racing against a 500ms deadline.
+  const gasLimit = 500000n;
+  log(`  gasLimit     : ${gasLimit} (fixed for speed)`);
 
   try {
-    const hash = await walletClient.writeContract({
-      address: curveAddr, abi: CURVE_BUY_ABI, functionName: "buy",
-      args, value: buyAmountWei, gas: gasLimit,
-      maxFeePerGas: GAS_WEI, maxPriorityFeePerGas: GAS_WEI,
+    // Build + sign locally ONCE, then broadcast the same signed tx via ALL RPCs in parallel.
+    // First RPC to include it wins. This slashes propagation latency vs relying on one RPC.
+    const nonce = await client.getTransactionCount({ address: buyer, blockTag: "pending" });
+    const request = await walletClient.prepareTransactionRequest({
+      to: curveAddr,
+      data: encodeCurveBuyData(args),
+      value: buyAmountWei,
+      gas: gasLimit,
+      maxFeePerGas: GAS_WEI,
+      maxPriorityFeePerGas: GAS_WEI,
+      nonce,
+      account,
     });
-    ok(`buy tx sent: ${hash}`);
+    const signed = await walletClient.signTransaction(request);
+    log(`  signed in    : ${Date.now() - tFire}ms`);
+
+    // Broadcast in parallel — winner is whichever RPC returns the tx hash first.
+    const bcs = httpClients.map((c) =>
+      c.request({ method: "eth_sendRawTransaction", params: [signed] })
+        .then((h) => ({ ok: true, hash: h }))
+        .catch((e) => ({ ok: false, err: e.shortMessage || e.message }))
+    );
+    const results = await Promise.all(bcs);
+    const winners = results.filter((r) => r.ok);
+    if (winners.length === 0) {
+      err(`all RPC broadcasts failed. errors: ${results.map((r) => r.err).join(" | ")}`);
+      fired = false;
+      return;
+    }
+    const hash = winners[0].hash;
+    ok(`buy tx broadcast in ${Date.now() - tFire}ms via ${winners.length}/${httpClients.length} RPCs: ${hash}`);
+
+    // Wait for confirmation on the fastest RPC.
+    const tWait = Date.now();
     const receipt = await client.waitForTransactionReceipt({ hash });
-    if (receipt.status === "success") ok(`buy CONFIRMED in block ${receipt.blockNumber}`);
+    log(`  confirmed in ${Date.now() - tWait}ms → block ${receipt.blockNumber}`);
+    if (receipt.status === "success") ok(`buy CONFIRMED — total fire→confirmed = ${Date.now() - tFire}ms`);
     else err(`buy FAILED on-chain: ${hash}`);
   } catch (e) {
-    err(`buy broadcast failed: ${e.shortMessage || e.message}`);
-    fired = false; // let another detection retry
+    err(`buy failed: ${e.shortMessage || e.message}`);
+    fired = false;
     return;
   }
   process.exit(0);
+}
+
+// Local calldata encoder for curve.buy(uint256, uint256, address) — avoids a round-trip.
+function encodeCurveBuyData([quoteIn, minTokensOut, recipient]) {
+  const sel = "0x59a87bc1"; // buy(uint256,uint256,address) — pons v2 canonical selector
+  const pad = (h) => h.replace(/^0x/, "").padStart(64, "0");
+  const qIn = pad(quoteIn.toString(16));
+  const mIn = pad(minTokensOut.toString(16));
+  const rec = pad(recipient.slice(2).toLowerCase());
+  return sel + qIn + mIn + rec;
 }
 
 async function scanBlock(client, block, sourceLabel) {
@@ -424,12 +457,17 @@ async function main() {
           seenTxs.add(tx.hash);
           log(`(${label}) ✔ dev→factory tx: ${tx.hash} — resolving curve…`);
 
+          // Hammer the receipt across ALL RPCs in parallel (first-wins) at RECEIPT_POLL_MS.
+          const t0 = Date.now();
           let found = null;
-          for (let attempt = 0; attempt < 60 && !found; attempt++) {
-            found = await findLaunchedCurve(client, tx.hash).catch(() => null);
-            if (!found) await new Promise((r) => setTimeout(r, 100));
+          while (!found && Date.now() - t0 < RECEIPT_MAX_MS) {
+            const attempts = httpClients.map((c) => findLaunchedCurve(c, tx.hash).catch(() => null));
+            const results = await Promise.all(attempts);
+            found = results.find(Boolean) ?? null;
+            if (!found) await new Promise((r) => setTimeout(r, RECEIPT_POLL_MS));
           }
-          if (!found) { warn(`could not resolve curve for ${tx.hash} — receipt didn't expose a token/curve. Was the tx even a launch?`); continue; }
+          if (!found) { warn(`no curve found in ${Date.now() - t0}ms for ${tx.hash} — bailing`); continue; }
+          log(`  curve resolved in ${Date.now() - t0}ms`);
           await fire(found.curve, tx.hash);
           return;
         }
