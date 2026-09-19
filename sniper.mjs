@@ -260,6 +260,20 @@ async function fire(curveAddr, sourceHash) {
 
   const minOut = 0n; // slippage protection disabled for max speed — user is snipe-exempt
   const gasLimit = 500000n;
+  // Pre-flight balance check — catches "insufficient funds" BEFORE we sign+broadcast, since some
+  // RPCs return a generic "Missing or invalid parameters" for it and the cause isn't obvious.
+  const maxGasCost = gasLimit * GAS_WEI;
+  const totalNeeded = buyAmountWei + maxGasCost;
+  try {
+    const bal = await client.getBalance({ address: buyer });
+    if (bal < totalNeeded) {
+      err(`INSUFFICIENT FUNDS: have ${formatEther(bal)} ETH, need ${formatEther(totalNeeded)} ETH ` +
+          `(${formatEther(buyAmountWei)} buy + ${formatEther(maxGasCost)} max gas @ ${GAS_GWEI} gwei × ${gasLimit})`);
+      err(`FIX: top up buyer OR lower GAS_GWEI (currently ${GAS_GWEI}) OR lower buy amount`);
+      fired = false;
+      return;
+    }
+  } catch { /* if balance check fails, keep going — broadcast will error clearly enough */ }
 
   try {
     // Hand-build the tx — bypass viem's prepareTransactionRequest which does 2-3 RPC calls.
