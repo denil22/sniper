@@ -166,11 +166,18 @@ let fired = false;
 const seenTxs = new Set(); // dedupe across all RPCs
 const factoryLower = PONS_FACTORY.toLowerCase();
 
+// A tx is a "launch candidate" if from == dev AND to == pons factory. We don't require the
+// selector to be 0xa72101af any more — pons could rev their factory, or the user could route
+// through a proxy. Any factory call from the dev is worth chasing.
 function isTargetLaunch(tx) {
   if (!tx || !tx.hash || !tx.to || !tx.input) return false;
   if (tx.to.toLowerCase() !== factoryLower) return false;
   if ((tx.from || "").toLowerCase() !== devWallet) return false;
-  return tx.input.slice(0, 10).toLowerCase() === PONS_LAUNCH_SELECTOR;
+  return true;
+}
+// Optional stricter check that matches ONLY the canonical launchToken selector.
+function isCanonicalLaunchSelector(tx) {
+  return (tx.input || "0x").slice(0, 10).toLowerCase() === PONS_LAUNCH_SELECTOR;
 }
 
 // Extract the launched curve from a launch-tx receipt: scan every factory log's topics + data
@@ -380,46 +387,62 @@ async function main() {
   }
 
   async function onNonceJump(client, i, oldN, newN, label) {
-    log(`(${label}) nonce jump ${oldN} → ${newN} — dev sent ${newN - oldN} tx, hunting launch call…`);
-    // Try pending block first (unmined mempool). Then latest confirmed. Whichever finds it wins.
-    // If we find a tx from dev that ISN'T a launchToken, log it so the user can debug.
+    log(`(${label}) nonce jump ${oldN} → ${newN} — dev sent ${newN - oldN} tx, hunting…`);
+
+    // Widen the search: pending, latest, and the last 10 confirmed blocks. On Robinhood's
+    // 100ms cadence, 10 blocks = 1 second — more than enough to catch any tx from the last hop.
+    const latestBlockNum = await client.getBlockNumber().catch(() => null);
+    const tags = ["pending", "latest"];
+    if (latestBlockNum != null) {
+      for (let d = 1; d <= 10; d++) tags.push(latestBlockNum - BigInt(d));
+    }
+
     let sawAnyDevTx = false;
-    for (const tag of ["pending", "latest"]) {
+    let sawAnyToFactory = false;
+    for (const tag of tags) {
       try {
-        const block = await client.getBlock({ blockTag: tag, includeTransactions: true });
+        const block = typeof tag === "string"
+          ? await client.getBlock({ blockTag: tag, includeTransactions: true })
+          : await client.getBlock({ blockNumber: tag, includeTransactions: true });
         for (const tx of block.transactions || []) {
           if (typeof tx === "string") continue;
           if ((tx.from || "").toLowerCase() !== devWallet) continue;
           sawAnyDevTx = true;
           if (seenTxs.has(tx.hash)) continue;
-          if (!isTargetLaunch(tx)) {
-            log(`(${label}) dev tx in ${tag} block is NOT a launchToken — to=${tx.to} sel=${(tx.input || "0x").slice(0, 10)} hash=${tx.hash}`);
+          const to = (tx.to || "").toLowerCase();
+          const sel = (tx.input || "0x").slice(0, 10);
+          // Log every dev tx we find so we can see what's happening in real time.
+          log(`(${label}) dev tx in ${tag}: to=${tx.to} sel=${sel} hash=${tx.hash}`);
+          if (to !== factoryLower) {
             seenTxs.add(tx.hash);
-            continue;
+            continue; // dev txed to something else — not a launch
+          }
+          sawAnyToFactory = true;
+          if (!isCanonicalLaunchSelector(tx)) {
+            log(`(${label}) ↳ selector ${sel} isn't the known launchToken selector (${PONS_LAUNCH_SELECTOR}) — chasing anyway`);
           }
           seenTxs.add(tx.hash);
-          log(`(${label}) ✔ launch tx in ${tag} block: ${tx.hash}`);
+          log(`(${label}) ✔ dev→factory tx: ${tx.hash} — resolving curve…`);
 
-          // If the tx is still pending, we need to wait for the receipt. Give it a 6s window.
           let found = null;
           for (let attempt = 0; attempt < 60 && !found; attempt++) {
             found = await findLaunchedCurve(client, tx.hash).catch(() => null);
             if (!found) await new Promise((r) => setTimeout(r, 100));
           }
-          if (!found) { warn(`could not resolve curve for ${tx.hash} — timed out waiting for receipt`); continue; }
+          if (!found) { warn(`could not resolve curve for ${tx.hash} — receipt didn't expose a token/curve. Was the tx even a launch?`); continue; }
           await fire(found.curve, tx.hash);
           return;
         }
       } catch (e) {
-        // pending block may not be supported by every RPC — that's fine, try next tag
         stats[i].errN++;
         stats[i].lastErr = (e.shortMessage || e.message || "").slice(0, 80);
       }
     }
     if (!sawAnyDevTx) {
-      warn(`(${label}) nonce jumped but dev's tx wasn't in pending or latest block — RPC may be lagging. Retrying next poll.`);
-      // Roll back so next poll retries; guarantees we don't miss a slow-to-propagate launch.
+      warn(`(${label}) nonce jumped but dev's tx wasn't in pending or the last 10 blocks — RPC lagging or tx replaced. Rolling back to retry.`);
       stats[i].lastNonce = oldN;
+    } else if (!sawAnyToFactory) {
+      warn(`(${label}) dev's tx wasn't to the pons factory (${PONS_FACTORY}). Maybe pons rev'd the factory, or the dev is calling through a proxy — paste the tx hash to me to inspect.`);
     }
   }
 
