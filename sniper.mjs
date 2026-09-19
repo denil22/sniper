@@ -33,7 +33,7 @@ import {
 } from "./lib.mjs";
 
 const CHAIN_ID = 4663;
-const POLL_MS = 50;              // dev-nonce poll cadence per RPC
+const POLL_MS = 25;              // dev-nonce poll cadence per RPC (halved for 1-block latency target)
 const RECEIPT_POLL_MS = 20;      // hammer the receipt lookup once we see the launch
 const RECEIPT_MAX_MS = 500;      // give up chasing a receipt after this many ms
 const HEARTBEAT_MS = 1000;       // show it's alive every second
@@ -171,6 +171,7 @@ let devWallet = null;      // filled after prompt
 let buyAmountWei = 0n;
 let slippageBps = 0;
 let fired = false;
+let buyerNonce = null;     // cached buyer nonce — primed at startup, incremented locally
 const seenTxs = new Set(); // dedupe across all RPCs
 const factoryLower = PONS_FACTORY.toLowerCase();
 
@@ -191,6 +192,37 @@ async function findLaunchedCurve(client, txHash) {
       });
       if (curve && curve !== ZERO) return { token: candidate, curve: curve.toLowerCase() };
     } catch { /* not a pons token */ }
+  }
+  return null;
+}
+
+// FAST PATH: given a pending launch tx (not yet mined), simulate it via eth_call against
+// pending state. Extract candidate addresses from the returned data + any logs the RPC
+// exposes, then call `.curve()` on each. Skips waiting for the tx to mine → saves ~100ms.
+async function findLaunchedCurveFromPendingTx(client, tx) {
+  try {
+    // eth_call simulates the tx against pending state without mining it. For pons's launchToken
+    // which returns (address, address), the return data contains both addresses.
+    const raw = await client.request({
+      method: "eth_call",
+      params: [{
+        from: tx.from,
+        to: tx.to,
+        data: tx.input,
+        value: tx.value,
+      }, "pending"],
+    });
+    const candidates = candidatesFromSimulation(raw, null, devWallet);
+    for (const c of candidates) {
+      try {
+        const curve = await client.readContract({
+          address: c, abi: TOKEN_ABI, functionName: "curve", blockTag: "pending",
+        });
+        if (curve && curve !== ZERO) return { token: c, curve: curve.toLowerCase() };
+      } catch { /* not a pons token */ }
+    }
+  } catch {
+    // eth_call reverted or RPC doesn't support it — caller falls back to receipt-based resolve.
   }
   return null;
 }
@@ -226,30 +258,28 @@ async function fire(curveAddr, sourceHash) {
   log(`  spend        : ${formatEther(buyAmountWei)} ETH`);
   log(`  gas          : ${GAS_GWEI}/${GAS_GWEI} gwei`);
 
-  const minOut = await computeMinTokensOut(client, curveAddr);
-  const args = [buyAmountWei, minOut, buyer];
-
-  // Skip gas estimation for speed — use a fat default. Estimation adds ~50-100ms of RPC time
-  // that we don't have when we're racing against a 500ms deadline.
+  const minOut = 0n; // slippage protection disabled for max speed — user is snipe-exempt
   const gasLimit = 500000n;
-  log(`  gasLimit     : ${gasLimit} (fixed for speed)`);
 
   try {
-    // Build + sign locally ONCE, then broadcast the same signed tx via ALL RPCs in parallel.
-    // First RPC to include it wins. This slashes propagation latency vs relying on one RPC.
-    const nonce = await client.getTransactionCount({ address: buyer, blockTag: "pending" });
-    const request = await walletClient.prepareTransactionRequest({
+    // Hand-build the tx — bypass viem's prepareTransactionRequest which does 2-3 RPC calls.
+    // Nonce is cached and incremented locally; we already know chainId + gas.
+    const nonce = buyerNonce;
+    buyerNonce = nonce + 1; // increment optimistically; roll back on failure
+
+    const request = {
       to: curveAddr,
-      data: encodeCurveBuyData(...args),
+      data: "0x" + encodeCurveBuyData(buyAmountWei, minOut, buyer),
       value: buyAmountWei,
       gas: gasLimit,
       maxFeePerGas: GAS_WEI,
       maxPriorityFeePerGas: GAS_WEI,
       nonce,
-      account,
-    });
-    const signed = await walletClient.signTransaction(request);
-    log(`  signed in    : ${Date.now() - tFire}ms`);
+      chainId: CHAIN_ID,
+      type: "eip1559",
+    };
+    const signed = await account.signTransaction(request);
+    log(`  signed in    : ${Date.now() - tFire}ms (nonce=${nonce})`);
 
     // Broadcast in parallel — winner is whichever RPC returns the tx hash first.
     const bcs = httpClients.map((c) =>
@@ -261,6 +291,7 @@ async function fire(curveAddr, sourceHash) {
     const winners = results.filter((r) => r.ok);
     if (winners.length === 0) {
       err(`all RPC broadcasts failed. errors: ${results.map((r) => r.err).join(" | ")}`);
+      buyerNonce = buyerNonce - 1; // roll back cached nonce so the retry uses the same slot
       fired = false;
       return;
     }
@@ -275,6 +306,7 @@ async function fire(curveAddr, sourceHash) {
     else err(`buy FAILED on-chain: ${hash}`);
   } catch (e) {
     err(`buy failed: ${e.shortMessage || e.message}`);
+    buyerNonce = buyerNonce - 1; // roll back cached nonce
     fired = false;
     return;
   }
@@ -313,12 +345,21 @@ async function main() {
   log(`buy amount      : ${amountEth} ETH  (=${buyAmountWei} wei)`);
   log(`slippage        : ${slippagePct}%  (${slippageBps} bps)`);
 
-  // Sanity: buyer balance check
+  // Sanity: buyer balance check + prime buyer nonce (used by the fast-path fire).
   try {
-    const bal = await httpClients[0].getBalance({ address: buyer });
+    const [bal, n] = await Promise.all([
+      httpClients[0].getBalance({ address: buyer }),
+      httpClients[0].getTransactionCount({ address: buyer, blockTag: "pending" }),
+    ]);
     log(`buyer balance   : ${formatEther(bal)} ETH`);
+    log(`buyer nonce     : ${n} (cached — sniper increments locally to skip RPC round-trip on fire)`);
+    buyerNonce = n;
     if (bal < buyAmountWei) warn("buyer balance is below buy amount — top up before the launch fires");
-  } catch { /* silent */ }
+  } catch (e) { warn(`prime failed: ${e.shortMessage || e.message}`); }
+
+  // Warm the HTTP/1.1 connection to each RPC so the first fire doesn't pay TCP+TLS handshake.
+  await Promise.all(httpClients.map((c) => c.getBlockNumber().catch(() => null)));
+  log(`warmed          : ${httpClients.length} HTTPS connections`);
 
   // Wallet-centric watcher. For each RPC we prefer, in order:
   //   1. txpool_contentFrom(dev)               — geth-style, returns dev's pending txs directly.
@@ -429,17 +470,27 @@ async function main() {
           seenTxs.add(tx.hash);
           log(`(${label}) ✔ dev→${via} tx: ${tx.hash} — resolving curve…`);
 
-          // Hammer the receipt across ALL RPCs in parallel (first-wins) at RECEIPT_POLL_MS.
+          // FAST PATH: if we found the tx in the "pending" tag it hasn't been mined yet.
+          // Simulate it via eth_call to extract the curve — no receipt wait needed.
           const t0 = Date.now();
           let found = null;
-          while (!found && Date.now() - t0 < RECEIPT_MAX_MS) {
-            const attempts = httpClients.map((c) => findLaunchedCurve(c, tx.hash).catch(() => null));
-            const results = await Promise.all(attempts);
-            found = results.find(Boolean) ?? null;
-            if (!found) await new Promise((r) => setTimeout(r, RECEIPT_POLL_MS));
+          if (tag === "pending") {
+            found = await findLaunchedCurveFromPendingTx(client, tx).catch(() => null);
+            if (found) log(`  curve resolved in ${Date.now() - t0}ms (via pending-tx simulation)`);
           }
+
+          // Fallback: wait for receipt across all RPCs.
+          if (!found) {
+            while (!found && Date.now() - t0 < RECEIPT_MAX_MS) {
+              const attempts = httpClients.map((c) => findLaunchedCurve(c, tx.hash).catch(() => null));
+              const results = await Promise.all(attempts);
+              found = results.find(Boolean) ?? null;
+              if (!found) await new Promise((r) => setTimeout(r, RECEIPT_POLL_MS));
+            }
+            if (found) log(`  curve resolved in ${Date.now() - t0}ms (via receipt)`);
+          }
+
           if (!found) { warn(`no curve found in ${Date.now() - t0}ms for ${tx.hash} — bailing`); continue; }
-          log(`  curve resolved in ${Date.now() - t0}ms`);
           await fire(found.curve, tx.hash);
           return;
         }

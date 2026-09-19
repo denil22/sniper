@@ -19,6 +19,7 @@ import {
   isTargetLaunch,
   isCanonicalLaunchSelector,
   candidateAddressesFromReceipt,
+  candidatesFromSimulation,
   routedVia,
   encodeCurveBuyData,
 } from "./lib.mjs";
@@ -175,4 +176,47 @@ test("encodeCurveBuyData: produces correct selector + 3 padded args", () => {
 test("encodeCurveBuyData: zero args produce all zeros after selector", () => {
   const data = encodeCurveBuyData(0n, 0n, "0x0000000000000000000000000000000000000000");
   assert.equal(data, "0x59a87bc1" + "0".repeat(64 * 3));
+});
+
+// ─── candidatesFromSimulation ───────────────────────────────────────────────
+// pons's launchToken returns (address token, address curve). Simulation via eth_call gives us
+// the packed return data. We must extract both addresses without waiting for the tx to mine.
+test("candidatesFromSimulation: extracts token + curve from ABI-encoded (address, address) return", () => {
+  const token = "5830640b5de07898d28ec384a0c6b0e27a27a20f";
+  const curve = "dd52b7445d7edf7595c8e771641c2a15168f1fc1";
+  const returnData = "0x" +
+    "0".repeat(24) + token +
+    "0".repeat(24) + curve;
+  const cs = candidatesFromSimulation(returnData, null, DEV);
+  const set = new Set(cs);
+  assert.ok(set.has("0x" + token), "expected token in candidates");
+  assert.ok(set.has("0x" + curve), "expected curve in candidates");
+});
+
+test("candidatesFromSimulation: also processes logs when provided (debug_traceCall path)", () => {
+  const logs = [{
+    address: CURVE_ADDR,
+    topics: ["0x908408e307fc569b417f6cbec5d5a06f44a0a505ac0479b47d421a4b2fd6a1e6"],
+    data: "0x000000000000000000000000" + TOKEN_ADDR.slice(2),
+  }];
+  const cs = candidatesFromSimulation(null, logs, DEV);
+  const set = new Set(cs);
+  assert.ok(set.has(TOKEN_ADDR.toLowerCase()), "expected token from log data");
+  assert.ok(set.has(CURVE_ADDR.toLowerCase()), "expected curve (log.address)");
+});
+
+test("candidatesFromSimulation: excludes factory / forwarder / dev / zero even from return data", () => {
+  const returnData = "0x" +
+    "0".repeat(24) + PONS_FACTORY.slice(2).toLowerCase() +
+    "0".repeat(24) + PONS_LAUNCH_FORWARDER.slice(2).toLowerCase() +
+    "0".repeat(24) + DEV.slice(2) +
+    "0".repeat(64); // zero address
+  const cs = candidatesFromSimulation(returnData, null, DEV);
+  assert.equal(cs.length, 0, "all candidates were infra addrs and should be filtered");
+});
+
+test("candidatesFromSimulation: handles empty inputs safely", () => {
+  assert.deepEqual(candidatesFromSimulation("", null, DEV), []);
+  assert.deepEqual(candidatesFromSimulation(null, [], DEV), []);
+  assert.deepEqual(candidatesFromSimulation("0x", null, DEV), []);
 });

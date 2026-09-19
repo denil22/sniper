@@ -64,6 +64,41 @@ export function candidateAddressesFromReceipt(receipt, devWallet) {
   return Array.from(seen);
 }
 
+/**
+ * Extract candidates from an eth_call simulation's log output. Same logic as
+ * candidateAddressesFromReceipt but the input is either a decoded logs array (from
+ * debug_traceCall) or a raw hex return from eth_call (whose returned data may contain the
+ * curve address as a return value — pons's launchToken returns (address token, address curve)).
+ *
+ * For pons's launchToken(...) → returns (address, address), the return data is 64 bytes:
+ *   [0..32) = token address (padded)
+ *   [32..64) = curve address (padded)
+ *
+ * We extract both and return them as strings for the caller to try. If the RPC returns logs
+ * (via debug_traceCall/callTracer), we also process those.
+ */
+export function candidatesFromSimulation(returnData, logs, devWallet) {
+  const out = new Set();
+  // Pull addresses from return data if it looks like it contains any.
+  if (typeof returnData === "string" && returnData.length >= 2) {
+    const d = returnData.replace(/^0x/, "");
+    for (let i = 24; i + 40 <= d.length; i += 64) {
+      out.add("0x" + d.slice(i, i + 40).toLowerCase());
+    }
+  }
+  // Also pull from logs if provided.
+  if (Array.isArray(logs)) {
+    for (const a of candidateAddressesFromReceipt({ logs }, devWallet)) {
+      out.add(a);
+    }
+  }
+  out.delete(ZERO);
+  out.delete(PONS_FACTORY.toLowerCase());
+  out.delete(PONS_LAUNCH_FORWARDER.toLowerCase());
+  if (devWallet) out.delete(devWallet.toLowerCase());
+  return Array.from(out);
+}
+
 /** Format labels for which entrypoint routed a tx. */
 export function routedVia(toAddress) {
   const to = (toAddress || "").toLowerCase();
