@@ -443,7 +443,7 @@ async function main() {
     }
 
     let sawAnyDevTx = false;
-    let sawAnyToFactory = false;
+    let sawAnyToLaunchTarget = false;
     for (const tag of tags) {
       try {
         const block = typeof tag === "string"
@@ -458,16 +458,18 @@ async function main() {
           const sel = (tx.input || "0x").slice(0, 10);
           // Log every dev tx we find so we can see what's happening in real time.
           log(`(${label}) dev tx in ${tag}: to=${tx.to} sel=${sel} hash=${tx.hash}`);
-          if (to !== factoryLower) {
+          // Match either the pons factory OR the launchForwarder.
+          if (!LAUNCH_TARGETS.has(to)) {
             seenTxs.add(tx.hash);
             continue; // dev txed to something else — not a launch
           }
-          sawAnyToFactory = true;
-          if (!isCanonicalLaunchSelector(tx)) {
+          sawAnyToLaunchTarget = true;
+          const routedVia = to === factoryLower ? "factory" : "forwarder";
+          if (to === factoryLower && !isCanonicalLaunchSelector(tx)) {
             log(`(${label}) ↳ selector ${sel} isn't the known launchToken selector (${PONS_LAUNCH_SELECTOR}) — chasing anyway`);
           }
           seenTxs.add(tx.hash);
-          log(`(${label}) ✔ dev→factory tx: ${tx.hash} — resolving curve…`);
+          log(`(${label}) ✔ dev→${routedVia} tx: ${tx.hash} — resolving curve…`);
 
           // Hammer the receipt across ALL RPCs in parallel (first-wins) at RECEIPT_POLL_MS.
           const t0 = Date.now();
@@ -491,8 +493,8 @@ async function main() {
     if (!sawAnyDevTx) {
       warn(`(${label}) nonce jumped but dev's tx wasn't in pending or the last 10 blocks — RPC lagging or tx replaced. Rolling back to retry.`);
       stats[i].lastNonce = oldN;
-    } else if (!sawAnyToFactory) {
-      warn(`(${label}) dev's tx wasn't to the pons factory (${PONS_FACTORY}). Maybe pons rev'd the factory, or the dev is calling through a proxy — paste the tx hash to me to inspect.`);
+    } else if (!sawAnyToLaunchTarget) {
+      warn(`(${label}) dev's tx wasn't to the pons factory OR the launchForwarder. Not a launch — paste the tx hash if you think it should be.`);
     }
   }
 
