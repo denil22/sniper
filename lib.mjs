@@ -107,6 +107,35 @@ export function routedVia(toAddress) {
   return "unknown";
 }
 
+/**
+ * Parse a wallet selection string like "1,3,5", "1-3,5", or "all" into a Set of 1-based
+ * indices bounded by [1, max]. Returns { ok, value?: Set<number>, err?: string }.
+ * Used by the terminal prompt to let the user pick which wallets from pk.txt should fire.
+ */
+export function parseWalletSelection(raw, max) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  if (s === "all" || s === "*") {
+    return { ok: true, value: new Set(Array.from({ length: max }, (_, i) => i + 1)) };
+  }
+  const out = new Set();
+  for (const part of s.split(",").map((p) => p.trim()).filter(Boolean)) {
+    const m = part.match(/^(\d+)-(\d+)$/);
+    if (m) {
+      const a = Number(m[1]), b = Number(m[2]);
+      if (a < 1 || b > max || a > b) return { ok: false, err: `range ${part} out of [1, ${max}]` };
+      for (let i = a; i <= b; i++) out.add(i);
+    } else if (/^\d+$/.test(part)) {
+      const n = Number(part);
+      if (n < 1 || n > max) return { ok: false, err: `${n} out of [1, ${max}]` };
+      out.add(n);
+    } else {
+      return { ok: false, err: `bad token "${part}"` };
+    }
+  }
+  if (out.size === 0) return { ok: false, err: "no wallets selected" };
+  return { ok: true, value: out };
+}
+
 /** Local calldata encoder for curve.buy(uint256, uint256, address) — bypasses viem's ABI encoder. */
 export function encodeCurveBuyData(quoteIn, minTokensOut, recipient) {
   const sel = "0x59a87bc1"; // pons v2 canonical buy selector — verified on-chain

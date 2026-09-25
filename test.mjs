@@ -22,6 +22,7 @@ import {
   candidatesFromSimulation,
   routedVia,
   encodeCurveBuyData,
+  parseWalletSelection,
 } from "./lib.mjs";
 
 const DEV = "0x9a4119f7995979cb075be261fc5bd503e9b78fee";
@@ -232,4 +233,68 @@ test("candidatesFromSimulation: handles empty inputs safely", () => {
   assert.deepEqual(candidatesFromSimulation("", null, DEV), []);
   assert.deepEqual(candidatesFromSimulation(null, [], DEV), []);
   assert.deepEqual(candidatesFromSimulation("0x", null, DEV), []);
+});
+
+// ─── parseWalletSelection ───────────────────────────────────────────────────
+test("parseWalletSelection: 'all' selects every wallet", () => {
+  const r = parseWalletSelection("all", 5);
+  assert.ok(r.ok);
+  assert.deepEqual(Array.from(r.value).sort((a, b) => a - b), [1, 2, 3, 4, 5]);
+});
+
+test("parseWalletSelection: '*' also selects every wallet", () => {
+  const r = parseWalletSelection("*", 3);
+  assert.ok(r.ok);
+  assert.equal(r.value.size, 3);
+});
+
+test("parseWalletSelection: comma list '1,3,5'", () => {
+  const r = parseWalletSelection("1,3,5", 5);
+  assert.ok(r.ok);
+  assert.deepEqual(Array.from(r.value).sort((a, b) => a - b), [1, 3, 5]);
+});
+
+test("parseWalletSelection: range '2-4'", () => {
+  const r = parseWalletSelection("2-4", 10);
+  assert.ok(r.ok);
+  assert.deepEqual(Array.from(r.value).sort((a, b) => a - b), [2, 3, 4]);
+});
+
+test("parseWalletSelection: mixed '1,3-5,8'", () => {
+  const r = parseWalletSelection("1,3-5,8", 10);
+  assert.ok(r.ok);
+  assert.deepEqual(Array.from(r.value).sort((a, b) => a - b), [1, 3, 4, 5, 8]);
+});
+
+test("parseWalletSelection: whitespace tolerated", () => {
+  const r = parseWalletSelection("  1 , 3-5 , 8 ", 10);
+  assert.ok(r.ok);
+  assert.deepEqual(Array.from(r.value).sort((a, b) => a - b), [1, 3, 4, 5, 8]);
+});
+
+test("parseWalletSelection: dedupe overlapping selection", () => {
+  const r = parseWalletSelection("1,2,1-3,2", 5);
+  assert.ok(r.ok);
+  assert.deepEqual(Array.from(r.value).sort((a, b) => a - b), [1, 2, 3]);
+});
+
+test("parseWalletSelection: out-of-range index rejected", () => {
+  const r = parseWalletSelection("6", 5);
+  assert.equal(r.ok, false);
+  assert.match(r.err, /out of/);
+});
+
+test("parseWalletSelection: reversed range rejected", () => {
+  const r = parseWalletSelection("5-2", 5);
+  assert.equal(r.ok, false);
+});
+
+test("parseWalletSelection: junk input rejected", () => {
+  const r = parseWalletSelection("abc", 5);
+  assert.equal(r.ok, false);
+});
+
+test("parseWalletSelection: empty input rejected", () => {
+  const r = parseWalletSelection("", 5);
+  assert.equal(r.ok, false);
 });

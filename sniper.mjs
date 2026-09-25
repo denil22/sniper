@@ -1,16 +1,17 @@
 #!/usr/bin/env node
-// Pons v2 launch sniper — single wallet, direct curve.buy(), HTTP polling only.
+// Pons v2 launch sniper — supports 1..N buyer wallets, direct curve.buy(), HTTPS polling only.
 //
 // Flow on start:
-//   1. Ensure rpcs.txt (one HTTPS RPC per line) and pk.txt (single 0x… line) exist.
+//   1. Ensure rpcs.txt (one HTTPS RPC per line) and pk.txt (one 0x… private key per line) exist.
 //      If missing, create empty templates and exit so the user can fill them.
-//   2. Read both files.
-//   3. Prompt the terminal for: dev wallet to monitor, buy amount (ETH), slippage %.
-//   4. Poll every configured RPC at 50ms in parallel. First to see the target launch tx wins.
+//   2. Read both files. pk.txt with multiple lines → each wallet fires in parallel (fanout snipe).
+//   3. Prompt the terminal for: dev wallet to monitor, buy amount PER WALLET (ETH), slippage %.
+//   4. Poll every configured RPC at 25ms in parallel. First to see the target launch tx wins.
 //   5. Extract the newly-launched curve from the launch tx receipt.
-//   6. Fire curve.buy(quoteIn, minTokensOut, buyer) with gas @ 1/1 gwei.
+//   6. For every buyer wallet: sign curve.buy(quoteIn, minTokensOut, buyer) in parallel, then
+//      broadcast every signed tx to every RPC. Same-block landing for all wallets.
 //
-// The buyer wallet MUST be on the pons snipe-exempt list at launch time — otherwise the buy
+// Every buyer wallet MUST be on the pons snipe-exempt list at launch time — otherwise the buy
 // pays up to ~99% snipe tax inside the first 3 seconds.
 
 import fs from "node:fs";
@@ -29,21 +30,17 @@ import {
   LAUNCH_TARGETS, ZERO,
   isTargetLaunch as isTargetLaunchLib,
   isCanonicalLaunchSelector as isCanonicalLaunchSelectorLib,
-  candidateAddressesFromReceipt, routedVia, encodeCurveBuyData,
+  candidateAddressesFromReceipt, candidatesFromSimulation,
+  routedVia, encodeCurveBuyData, parseWalletSelection,
 } from "./lib.mjs";
 
 const CHAIN_ID = 4663;
-const POLL_MS = 25;              // dev-nonce poll cadence per RPC (halved for 1-block latency target)
-const RECEIPT_POLL_MS = 20;      // hammer the receipt lookup once we see the launch
-const RECEIPT_MAX_MS = 500;      // give up chasing a receipt after this many ms
-const HEARTBEAT_MS = 1000;       // show it's alive every second
+const POLL_MS = 25;
+const RECEIPT_POLL_MS = 20;
+const RECEIPT_MAX_MS = 500;
+const HEARTBEAT_MS = 1000;
 const GAS_GWEI = 1n;
-const GAS_WEI = GAS_GWEI * 1_000_000_000n; // maxFee + priority both = 1 gwei
-const CURVE_BUY_ABI = [{
-  type: "function", name: "buy", stateMutability: "payable",
-  inputs: [{ type: "uint256" }, { type: "uint256" }, { type: "address" }],
-  outputs: [],
-}];
+const GAS_WEI = GAS_GWEI * 1_000_000_000n;
 const TOKEN_ABI = [{
   type: "function", name: "curve", stateMutability: "view",
   inputs: [], outputs: [{ type: "address" }],
@@ -91,8 +88,15 @@ const rpcsRaw = readOrTemplate(RPCS_TXT,
 `, "rpcs.txt");
 
 const pkRaw = readOrTemplate(PK_TXT,
-`# Paste the buyer wallet's private key on a single line (0x-prefixed 32-byte hex).
-# This wallet MUST be on the pons snipe-exempt list at launch time.
+`# Paste ONE buyer wallet private key per line (0x-prefixed 32-byte hex).
+# Every wallet listed here will fire the same snipe in parallel — enables fanout distribution.
+# EVERY listed wallet MUST be on the pons snipe-exempt list at launch time.
+# Example (1 wallet):
+# 0xabcdef...   (64 hex chars)
+# Example (fanout across 3 wallets):
+# 0xabcdef...
+# 0x111222...
+# 0x999888...
 `, "pk.txt");
 
 if (rpcsRaw === null || pkRaw === null) process.exit(1);
@@ -105,23 +109,42 @@ for (const u of rpcs) {
   if (!u.startsWith("https://")) { console.error(`✗ rpcs.txt: "${u}" is not https:// — HTTPS only.`); process.exit(1); }
 }
 
-const pkLine = pkRaw.split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("#"));
-if (!pkLine || !/^0x[0-9a-fA-F]{64}$/.test(pkLine)) {
-  console.error("✗ pk.txt: no valid 0x-prefixed 32-byte private key. Fix and re-run."); process.exit(1);
+const pkLines = pkRaw.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+if (pkLines.length === 0) {
+  console.error("✗ pk.txt: no private keys found. Add at least one 0x-prefixed 32-byte hex line."); process.exit(1);
+}
+for (let i = 0; i < pkLines.length; i++) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(pkLines[i])) {
+    console.error(`✗ pk.txt line ${i + 1}: "${pkLines[i].slice(0, 12)}…" is not a valid 0x-prefixed 32-byte hex private key.`); process.exit(1);
+  }
 }
 
-const account = privateKeyToAccount(pkLine);
-const buyer = account.address;
+// Build parallel wallet slots. Each slot: {account, address, nonce (cached)}.
+const wallets = pkLines.map((pk) => {
+  const account = privateKeyToAccount(pk);
+  return { account, address: account.address.toLowerCase(), nonce: null };
+});
+// Detect and warn on duplicates — same key twice would collide on nonces.
+const uniq = new Set(wallets.map((w) => w.address));
+if (uniq.size !== wallets.length) {
+  console.error("✗ pk.txt: duplicate private keys detected — every wallet must be distinct."); process.exit(1);
+}
 
 // ─── terminal prompts ───────────────────────────────────────────────────────
 async function prompt() {
   const rl = readline.createInterface({ input, output });
   console.log("");
   console.log("pons v2 sniper — enter run parameters");
-  console.log(`  buyer wallet : ${buyer}`);
-  console.log(`  rpcs         : ${rpcs.length} HTTPS`);
-  console.log(`  gas          : ${GAS_GWEI} gwei (maxFee + priority both)`);
-  console.log(`  poll         : ${POLL_MS} ms`);
+  console.log(`  rpcs          : ${rpcs.length} HTTPS`);
+  console.log(`  gas           : ${GAS_GWEI} gwei (maxFee + priority both)`);
+  console.log(`  poll          : ${POLL_MS} ms`);
+  console.log("");
+  console.log("buyer wallets loaded from pk.txt:");
+  for (let i = 0; i < wallets.length; i++) {
+    const w = wallets[i];
+    const bal = w.balWei != null ? `${formatEther(w.balWei)} ETH` : "?";
+    console.log(`  [${i + 1}] ${w.address}  bal=${bal}`);
+  }
   console.log("");
 
   async function ask(q, validate) {
@@ -136,20 +159,58 @@ async function prompt() {
   const dev = await ask("dev wallet to monitor (0x…): ", (s) =>
     isAddress(s) ? { ok: true, value: s.toLowerCase() } : { ok: false, err: "not a valid address" });
 
-  const amountEth = await ask("buy amount in ETH (e.g. 0.05): ", (s) => {
-    const n = Number(s);
-    if (!Number.isFinite(n) || n <= 0) return { ok: false, err: "must be a positive number" };
-    return { ok: true, value: s };
-  });
+  // Which wallets to use?
+  const selection = await ask(
+    wallets.length === 1
+      ? "which wallets? [Enter for '1']: "
+      : `which wallets to buy from? (e.g. 1,3 or 1-3 or 'all'): `,
+    (s) => {
+      if (!s && wallets.length === 1) return { ok: true, value: new Set([1]) };
+      const r = parseWalletSelection(s, wallets.length);
+      return r.ok ? { ok: true, value: r.value } : { ok: false, err: r.err };
+    }
+  );
+  const selectedIdx = Array.from(selection).sort((a, b) => a - b);
 
-  const slippagePct = await ask("slippage % (e.g. 5 for 5% — protects if the buy would return way less than expected): ", (s) => {
+  // Same amount for all, or per-wallet?
+  let mode = "same";
+  if (selectedIdx.length > 1) {
+    mode = await ask("buy amount — same for all selected, or per wallet? [same/per]: ", (s) => {
+      const t = s.toLowerCase();
+      if (!t || t === "same" || t === "s") return { ok: true, value: "same" };
+      if (t === "per" || t === "p") return { ok: true, value: "per" };
+      return { ok: false, err: "type 'same' or 'per'" };
+    });
+  }
+
+  const amountsEth = new Map(); // 1-based idx -> string ETH
+  if (mode === "same") {
+    const a = await ask(`buy amount in ETH (applied to ${selectedIdx.length} wallet${selectedIdx.length > 1 ? "s" : ""}): `, (s) => {
+      const n = Number(s);
+      if (!Number.isFinite(n) || n <= 0) return { ok: false, err: "must be a positive number" };
+      return { ok: true, value: s };
+    });
+    for (const i of selectedIdx) amountsEth.set(i, a);
+  } else {
+    for (const i of selectedIdx) {
+      const w = wallets[i - 1];
+      const a = await ask(`  wallet #${i} ${w.address} — buy amount (ETH): `, (s) => {
+        const n = Number(s);
+        if (!Number.isFinite(n) || n <= 0) return { ok: false, err: "must be a positive number" };
+        return { ok: true, value: s };
+      });
+      amountsEth.set(i, a);
+    }
+  }
+
+  const slippagePct = await ask("slippage % (e.g. 5): ", (s) => {
     const n = Number(s);
     if (!Number.isFinite(n) || n < 0 || n > 100) return { ok: false, err: "must be a number in [0, 100]" };
     return { ok: true, value: n };
   });
 
   rl.close();
-  return { dev, amountEth, slippagePct };
+  return { dev, selectedIdx, amountsEth, slippagePct };
 }
 
 // ─── viem clients ───────────────────────────────────────────────────────────
@@ -162,25 +223,19 @@ const chain = defineChain({
 const httpClients = rpcs.map((url) =>
   createPublicClient({ chain, transport: http(url, { timeout: 8_000, retryCount: 1 }) })
 );
-const walletClient = createWalletClient({
-  chain, account, transport: http(rpcs[0], { timeout: 8_000, retryCount: 1 }),
-});
 
 // ─── detection ──────────────────────────────────────────────────────────────
-let devWallet = null;      // filled after prompt
-let buyAmountWei = 0n;
+let devWallet = null;
 let slippageBps = 0;
 let fired = false;
-let buyerNonce = null;     // cached buyer nonce — primed at startup, incremented locally
-const seenTxs = new Set(); // dedupe across all RPCs
+// Filled after prompt: subset of `wallets` chosen by the user, each with .buyAmountWei set.
+let activeWallets = [];
+const seenTxs = new Set();
 const factoryLower = PONS_FACTORY.toLowerCase();
 
-// Local wrappers that inject the current devWallet — logic lives in lib.mjs and is unit-tested.
 const isTargetLaunch = (tx) => isTargetLaunchLib(tx, devWallet);
 const isCanonicalLaunchSelector = (tx) => isCanonicalLaunchSelectorLib(tx);
 
-// Extract the launched curve from a launch-tx receipt: scan every log for address candidates via
-// lib.candidateAddressesFromReceipt, then call `.curve()` on each — first to answer wins.
 async function findLaunchedCurve(client, txHash) {
   const receipt = await client.getTransactionReceipt({ hash: txHash });
   if (!receipt || receipt.status !== "success") return null;
@@ -196,20 +251,12 @@ async function findLaunchedCurve(client, txHash) {
   return null;
 }
 
-// FAST PATH: given a pending launch tx (not yet mined), simulate it via eth_call against
-// pending state. Extract candidate addresses from the returned data + any logs the RPC
-// exposes, then call `.curve()` on each. Skips waiting for the tx to mine → saves ~100ms.
 async function findLaunchedCurveFromPendingTx(client, tx) {
   try {
-    // eth_call simulates the tx against pending state without mining it. For pons's launchToken
-    // which returns (address, address), the return data contains both addresses.
     const raw = await client.request({
       method: "eth_call",
       params: [{
-        from: tx.from,
-        to: tx.to,
-        data: tx.input,
-        value: tx.value,
+        from: tx.from, to: tx.to, data: tx.input, value: tx.value,
       }, "pending"],
     });
     const candidates = candidatesFromSimulation(raw, null, devWallet);
@@ -221,113 +268,140 @@ async function findLaunchedCurveFromPendingTx(client, tx) {
         if (curve && curve !== ZERO) return { token: c, curve: curve.toLowerCase() };
       } catch { /* not a pons token */ }
     }
-  } catch {
-    // eth_call reverted or RPC doesn't support it — caller falls back to receipt-based resolve.
-  }
+  } catch { /* eth_call reverted or unsupported */ }
   return null;
 }
 
-// Try to compute minTokensOut from previewBuy. Falls back to 0 (no protection) with a warning
-// if the curve's ABI doesn't match our previewBuy signature.
-async function computeMinTokensOut(client, curveAddr) {
-  if (slippageBps === 0) return 0n;
-  try {
-    const [tokensOut] = await client.readContract({
-      address: curveAddr, abi: CURVE_PREVIEW_ABI, functionName: "previewBuy",
-      args: [buyer, buyAmountWei],
-    });
-    const min = (tokensOut * BigInt(10000 - slippageBps)) / 10000n;
-    log(`  preview      : ${tokensOut} tokens (expected). minOut @ ${slippageBps} bps = ${min}`);
-    return min;
-  } catch {
-    warn(`could not previewBuy — using minTokensOut=0 (slippage protection disabled for this curve)`);
-    return 0n;
-  }
-}
-
+// ─── fire (multi-wallet fanout, per-wallet buy amounts) ─────────────────────
 async function fire(curveAddr, sourceHash) {
   if (fired) return;
   fired = true;
 
   const client = httpClients[0];
   const tFire = Date.now();
+  const minOut = 0n; // speed-first: slippage off, exempt wallets don't need it
+  const gasLimit = 500000n;
+  const maxGasCost = gasLimit * GAS_WEI;
+  const totalSpend = activeWallets.reduce((sum, w) => sum + w.buyAmountWei, 0n);
+
   log(`── LAUNCH DETECTED ──`);
   log(`  source tx    : ${sourceHash}`);
   log(`  curve        : ${curveAddr}`);
-  log(`  buyer        : ${buyer}`);
-  log(`  spend        : ${formatEther(buyAmountWei)} ETH`);
+  log(`  wallets      : ${activeWallets.length} selected`);
+  log(`  total spend  : ${formatEther(totalSpend)} ETH`);
   log(`  gas          : ${GAS_GWEI}/${GAS_GWEI} gwei`);
 
-  const minOut = 0n; // slippage protection disabled for max speed — user is snipe-exempt
-  const gasLimit = 500000n;
-  // Pre-flight balance check — catches "insufficient funds" BEFORE we sign+broadcast, since some
-  // RPCs return a generic "Missing or invalid parameters" for it and the cause isn't obvious.
-  const maxGasCost = gasLimit * GAS_WEI;
-  const totalNeeded = buyAmountWei + maxGasCost;
-  try {
-    const bal = await client.getBalance({ address: buyer });
-    if (bal < totalNeeded) {
-      err(`INSUFFICIENT FUNDS: have ${formatEther(bal)} ETH, need ${formatEther(totalNeeded)} ETH ` +
-          `(${formatEther(buyAmountWei)} buy + ${formatEther(maxGasCost)} max gas @ ${GAS_GWEI} gwei × ${gasLimit})`);
-      err(`FIX: top up buyer OR lower GAS_GWEI (currently ${GAS_GWEI}) OR lower buy amount`);
-      fired = false;
-      return;
+  // Pre-flight: check every active wallet has funds for ITS OWN buy amount.
+  const balances = await Promise.all(activeWallets.map((w) =>
+    client.getBalance({ address: w.address }).catch(() => null)
+  ));
+  const eligible = [];
+  for (let i = 0; i < activeWallets.length; i++) {
+    const w = activeWallets[i];
+    const need = w.buyAmountWei + maxGasCost;
+    const bal = balances[i];
+    if (bal === null) { warn(`  ${w.address}: balance check failed — including anyway`); eligible.push(w); continue; }
+    if (bal < need) {
+      err(`  ${w.address}: SKIPPED — have ${formatEther(bal)} ETH, need ${formatEther(need)} ETH (${formatEther(w.buyAmountWei)} buy + ${formatEther(maxGasCost)} gas)`);
+      continue;
     }
-  } catch { /* if balance check fails, keep going — broadcast will error clearly enough */ }
-
-  try {
-    // Hand-build the tx — bypass viem's prepareTransactionRequest which does 2-3 RPC calls.
-    // Nonce is cached and incremented locally; we already know chainId + gas.
-    const nonce = buyerNonce;
-    buyerNonce = nonce + 1; // increment optimistically; roll back on failure
-
-    // encodeCurveBuyData already returns a 0x-prefixed hex string. Do NOT prepend another "0x".
-    const request = {
-      to: curveAddr,
-      data: encodeCurveBuyData(buyAmountWei, minOut, buyer),
-      value: buyAmountWei,
-      gas: gasLimit,
-      maxFeePerGas: GAS_WEI,
-      maxPriorityFeePerGas: GAS_WEI,
-      nonce,
-      chainId: CHAIN_ID,
-      type: "eip1559",
-    };
-    const signed = await account.signTransaction(request);
-    log(`  signed in    : ${Date.now() - tFire}ms (nonce=${nonce})`);
-
-    // Broadcast in parallel — winner is whichever RPC returns the tx hash first.
-    const bcs = httpClients.map((c) =>
-      c.request({ method: "eth_sendRawTransaction", params: [signed] })
-        .then((h) => ({ ok: true, hash: h }))
-        .catch((e) => ({ ok: false, err: e.shortMessage || e.message }))
-    );
-    const results = await Promise.all(bcs);
-    const winners = results.filter((r) => r.ok);
-    if (winners.length === 0) {
-      err(`all RPC broadcasts failed. errors: ${results.map((r) => r.err).join(" | ")}`);
-      buyerNonce = buyerNonce - 1; // roll back cached nonce so the retry uses the same slot
-      fired = false;
-      return;
-    }
-    const hash = winners[0].hash;
-    ok(`buy tx broadcast in ${Date.now() - tFire}ms via ${winners.length}/${httpClients.length} RPCs: ${hash}`);
-
-    // Wait for confirmation on the fastest RPC.
-    const tWait = Date.now();
-    const receipt = await client.waitForTransactionReceipt({ hash });
-    log(`  confirmed in ${Date.now() - tWait}ms → block ${receipt.blockNumber}`);
-    if (receipt.status === "success") ok(`buy CONFIRMED — total fire→confirmed = ${Date.now() - tFire}ms`);
-    else err(`buy FAILED on-chain: ${hash}`);
-  } catch (e) {
-    err(`buy failed: ${e.shortMessage || e.message}`);
-    buyerNonce = buyerNonce - 1; // roll back cached nonce
-    fired = false;
-    return;
+    eligible.push(w);
   }
+  if (eligible.length === 0) {
+    err(`no wallet has sufficient balance — nothing to fire`);
+    fired = false; return;
+  }
+  log(`  eligible     : ${eligible.length}/${activeWallets.length} wallets have funds`);
+
+  // Sign all eligible wallets in parallel. Each uses its own cached nonce + own buy amount.
+  const signPromises = eligible.map(async (w) => {
+    const nonce = w.nonce;
+    w.nonce = nonce + 1;
+    try {
+      const request = {
+        to: curveAddr,
+        data: encodeCurveBuyData(w.buyAmountWei, minOut, w.address),
+        value: w.buyAmountWei,
+        gas: gasLimit,
+        maxFeePerGas: GAS_WEI,
+        maxPriorityFeePerGas: GAS_WEI,
+        nonce,
+        chainId: CHAIN_ID,
+        type: "eip1559",
+      };
+      const signed = await w.account.signTransaction(request);
+      return { wallet: w, nonce, signed, err: null };
+    } catch (e) {
+      w.nonce = nonce; // roll back cached nonce so we can retry the slot
+      return { wallet: w, nonce, signed: null, err: e.shortMessage || e.message };
+    }
+  });
+  const signResults = await Promise.all(signPromises);
+  const signed = signResults.filter((r) => r.signed);
+  if (signed.length === 0) {
+    err(`all wallets failed to sign: ${signResults.map((r) => r.err).join(" | ")}`);
+    for (const r of signResults) r.wallet.nonce = r.nonce; // roll back
+    fired = false; return;
+  }
+  log(`  signed       : ${signed.length}/${eligible.length} txs in ${Date.now() - tFire}ms`);
+
+  // Broadcast each signed tx to every RPC in parallel. That's N wallets × M RPCs total requests.
+  const broadcasts = [];
+  for (const r of signed) {
+    for (let i = 0; i < httpClients.length; i++) {
+      broadcasts.push(
+        httpClients[i].request({ method: "eth_sendRawTransaction", params: [r.signed] })
+          .then((h) => ({ wallet: r.wallet, nonce: r.nonce, rpc: i, ok: true, hash: h }))
+          .catch((e) => ({ wallet: r.wallet, nonce: r.nonce, rpc: i, ok: false, err: e.shortMessage || e.message }))
+      );
+    }
+  }
+  const bcResults = await Promise.all(broadcasts);
+
+  // Per-wallet outcome — a wallet succeeded if AT LEAST ONE RPC accepted its tx.
+  const perWalletHash = new Map();
+  const perWalletErr = new Map();
+  for (const r of bcResults) {
+    if (r.ok && !perWalletHash.has(r.wallet.address)) perWalletHash.set(r.wallet.address, r.hash);
+    if (!r.ok) {
+      const prev = perWalletErr.get(r.wallet.address) || [];
+      prev.push(r.err);
+      perWalletErr.set(r.wallet.address, prev);
+    }
+  }
+
+  // Roll back nonces for wallets that never got accepted anywhere.
+  for (const r of signed) {
+    if (!perWalletHash.has(r.wallet.address)) {
+      r.wallet.nonce = r.nonce; // slot never consumed
+      err(`  ${r.wallet.address}: all RPCs rejected — ${(perWalletErr.get(r.wallet.address) || []).slice(0, 1).join(" | ")}`);
+    }
+  }
+
+  const broadcastMs = Date.now() - tFire;
+  if (perWalletHash.size === 0) {
+    err(`no wallet made it on-chain — all broadcasts rejected. Cache reset for retry.`);
+    fired = false; return;
+  }
+  ok(`${perWalletHash.size}/${signed.length} wallets broadcast in ${broadcastMs}ms`);
+  for (const [addr, hash] of perWalletHash) log(`    ${addr}  →  ${hash}`);
+
+  // Wait for confirmations in parallel — report each wallet's success/failure independently.
+  const confirmations = Array.from(perWalletHash.entries()).map(async ([addr, hash]) => {
+    const t0 = Date.now();
+    try {
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      const dt = Date.now() - t0;
+      if (receipt.status === "success") ok(`  ${addr}: confirmed ${dt}ms (block ${receipt.blockNumber})`);
+      else err(`  ${addr}: reverted on-chain (${hash})`);
+    } catch (e) {
+      err(`  ${addr}: wait failed: ${e.shortMessage || e.message}`);
+    }
+  });
+  await Promise.all(confirmations);
+  log(`total fire→confirmed: ${Date.now() - tFire}ms`);
   process.exit(0);
 }
-
 
 async function scanBlock(client, block, sourceLabel) {
   const txs = block?.transactions || [];
@@ -339,7 +413,7 @@ async function scanBlock(client, block, sourceLabel) {
     log(`(${sourceLabel}) target launch tx from ${tx.from}: ${tx.hash}`);
     const found = await findLaunchedCurve(client, tx.hash);
     if (!found) {
-      warn(`could not resolve curve from ${tx.hash} — receipt may not be indexed yet, retrying via next scan`);
+      warn(`could not resolve curve from ${tx.hash} — retrying via next scan`);
       seenTxs.delete(tx.hash);
       continue;
     }
@@ -350,61 +424,60 @@ async function scanBlock(client, block, sourceLabel) {
 
 // ─── main ───────────────────────────────────────────────────────────────────
 async function main() {
-  const { dev, amountEth, slippagePct } = await prompt();
+  // Prime balances + nonces for ALL loaded wallets BEFORE the prompt so the picker
+  // can show each wallet's balance next to its address.
+  await Promise.all(wallets.map(async (w) => {
+    try {
+      const [bal, n] = await Promise.all([
+        httpClients[0].getBalance({ address: w.address }),
+        httpClients[0].getTransactionCount({ address: w.address, blockTag: "pending" }),
+      ]);
+      w.balWei = bal;
+      w.nonce = n;
+    } catch (e) { warn(`  ${w.address}: prime failed: ${e.shortMessage || e.message}`); }
+  }));
+
+  const { dev, selectedIdx, amountsEth, slippagePct } = await prompt();
   devWallet = dev;
-  buyAmountWei = parseEther(amountEth);
   slippageBps = Math.round(slippagePct * 100);
+
+  // Bind chosen wallets + their per-wallet buy amounts.
+  activeWallets = selectedIdx.map((i) => {
+    const w = wallets[i - 1];
+    w.buyAmountWei = parseEther(amountsEth.get(i));
+    return w;
+  });
 
   console.log("");
   log(`monitoring dev  : ${devWallet}`);
-  log(`buy amount      : ${amountEth} ETH  (=${buyAmountWei} wei)`);
+  log(`active wallets  : ${activeWallets.length}/${wallets.length}`);
+  for (const w of activeWallets) {
+    log(`  ${w.address}  buy=${formatEther(w.buyAmountWei)} ETH  bal=${w.balWei != null ? formatEther(w.balWei) : "?"} ETH  nonce=${w.nonce}`);
+  }
   log(`slippage        : ${slippagePct}%  (${slippageBps} bps)`);
 
-  // Sanity: buyer balance check + prime buyer nonce (used by the fast-path fire).
-  try {
-    const [bal, n] = await Promise.all([
-      httpClients[0].getBalance({ address: buyer }),
-      httpClients[0].getTransactionCount({ address: buyer, blockTag: "pending" }),
-    ]);
-    log(`buyer balance   : ${formatEther(bal)} ETH`);
-    log(`buyer nonce     : ${n} (cached — sniper increments locally to skip RPC round-trip on fire)`);
-    buyerNonce = n;
-    if (bal < buyAmountWei) warn("buyer balance is below buy amount — top up before the launch fires");
-  } catch (e) { warn(`prime failed: ${e.shortMessage || e.message}`); }
-
-  // Warm the HTTP/1.1 connection to each RPC so the first fire doesn't pay TCP+TLS handshake.
+  // Warm HTTP/1.1 to every RPC to skip TCP+TLS handshake on the fire path.
   await Promise.all(httpClients.map((c) => c.getBlockNumber().catch(() => null)));
   log(`warmed          : ${httpClients.length} HTTPS connections`);
 
-  // Wallet-centric watcher. For each RPC we prefer, in order:
-  //   1. txpool_contentFrom(dev)               — geth-style, returns dev's pending txs directly.
-  //                                              ZERO block scan, one call, one tx object.
-  //                                              Requires a private/geth RPC that exposes txpool.
-  //   2. eth_getTransactionCount(dev, "pending") + pending-block scan on jump (fallback).
-  //
-  // We probe each RPC once at boot to figure out which method it supports.
+  // RPC capability probe: txpool_contentFrom vs nonce-jump fallback.
   const stats = httpClients.map(() => ({
     pollN: 0, jumpN: 0, errN: 0, lastNonce: -1, lastErr: "",
-    method: "probing", // "txpool" | "nonce" | "probing"
+    method: "probing",
   }));
 
   async function probeTxpool(client) {
     try {
-      // Some RPCs return the object, some throw "method not found". We accept any non-throw as success.
       await client.transport.request({ method: "txpool_contentFrom", params: [devWallet] });
       return true;
     } catch { return false; }
   }
-  // Probe all RPCs in parallel.
   await Promise.all(httpClients.map(async (client, i) => {
     const has = await probeTxpool(client);
     stats[i].method = has ? "txpool" : "nonce";
   }));
-  const summary = stats.map((s, i) => `${new URL(rpcs[i]).host} → ${s.method}`).join(", ");
-  ok(`RPC capability probe: ${summary}`);
+  ok(`RPC capability probe: ${stats.map((s, i) => `${new URL(rpcs[i]).host} → ${s.method}`).join(", ")}`);
 
-
-  // Prime each RPC's baseline nonce (used by the nonce-jump fallback path).
   await Promise.all(httpClients.map(async (client, i) => {
     try {
       stats[i].lastNonce = await client.getTransactionCount({ address: devWallet, blockTag: "pending" });
@@ -412,8 +485,6 @@ async function main() {
   }));
   log(`baseline pending nonce for ${devWallet}: ${stats[0].lastNonce}`);
 
-  // txpool_contentFrom returns { pending: {nonce: tx}, queued: {nonce: tx} }.
-  // Match: to == pons factory AND input starts with 0xa72101af. Fires ONE-shot.
   async function pollTxpool(client, i, label) {
     stats[i].pollN++;
     try {
@@ -428,7 +499,6 @@ async function main() {
           seenTxs.add(tx.hash);
           stats[i].jumpN++;
           log(`(${label}) ✔ launch tx in txpool (nonce ${nonce}): ${tx.hash}`);
-          // Wait for receipt (up to 6s) then find curve.
           let found = null;
           for (let attempt = 0; attempt < 60 && !found; attempt++) {
             found = await findLaunchedCurve(client, tx.hash).catch(() => null);
@@ -447,15 +517,11 @@ async function main() {
 
   async function onNonceJump(client, i, oldN, newN, label) {
     log(`(${label}) nonce jump ${oldN} → ${newN} — dev sent ${newN - oldN} tx, hunting…`);
-
-    // Widen the search: pending, latest, and the last 10 confirmed blocks. On Robinhood's
-    // 100ms cadence, 10 blocks = 1 second — more than enough to catch any tx from the last hop.
     const latestBlockNum = await client.getBlockNumber().catch(() => null);
     const tags = ["pending", "latest"];
     if (latestBlockNum != null) {
       for (let d = 1; d <= 10; d++) tags.push(latestBlockNum - BigInt(d));
     }
-
     let sawAnyDevTx = false;
     let sawAnyToLaunchTarget = false;
     for (const tag of tags) {
@@ -470,13 +536,8 @@ async function main() {
           if (seenTxs.has(tx.hash)) continue;
           const to = (tx.to || "").toLowerCase();
           const sel = (tx.input || "0x").slice(0, 10);
-          // Log every dev tx we find so we can see what's happening in real time.
           log(`(${label}) dev tx in ${tag}: to=${tx.to} sel=${sel} hash=${tx.hash}`);
-          // Match either the pons factory OR the launchForwarder.
-          if (!LAUNCH_TARGETS.has(to)) {
-            seenTxs.add(tx.hash);
-            continue; // dev txed to something else — not a launch
-          }
+          if (!LAUNCH_TARGETS.has(to)) { seenTxs.add(tx.hash); continue; }
           sawAnyToLaunchTarget = true;
           const via = routedVia(to);
           if (to === factoryLower && !isCanonicalLaunchSelector(tx)) {
@@ -485,16 +546,12 @@ async function main() {
           seenTxs.add(tx.hash);
           log(`(${label}) ✔ dev→${via} tx: ${tx.hash} — resolving curve…`);
 
-          // FAST PATH: if we found the tx in the "pending" tag it hasn't been mined yet.
-          // Simulate it via eth_call to extract the curve — no receipt wait needed.
           const t0 = Date.now();
           let found = null;
           if (tag === "pending") {
             found = await findLaunchedCurveFromPendingTx(client, tx).catch(() => null);
-            if (found) log(`  curve resolved in ${Date.now() - t0}ms (via pending-tx simulation)`);
+            if (found) log(`  curve resolved in ${Date.now() - t0}ms (pending-tx simulation)`);
           }
-
-          // Fallback: wait for receipt across all RPCs.
           if (!found) {
             while (!found && Date.now() - t0 < RECEIPT_MAX_MS) {
               const attempts = httpClients.map((c) => findLaunchedCurve(c, tx.hash).catch(() => null));
@@ -504,7 +561,6 @@ async function main() {
             }
             if (found) log(`  curve resolved in ${Date.now() - t0}ms (via receipt)`);
           }
-
           if (!found) { warn(`no curve found in ${Date.now() - t0}ms for ${tx.hash} — bailing`); continue; }
           await fire(found.curve, tx.hash);
           return;
@@ -515,21 +571,17 @@ async function main() {
       }
     }
     if (!sawAnyDevTx) {
-      warn(`(${label}) nonce jumped but dev's tx wasn't in pending or the last 10 blocks — RPC lagging or tx replaced. Rolling back to retry.`);
+      warn(`(${label}) nonce jumped but dev's tx wasn't in pending or the last 10 blocks — RPC lagging. Rolling back.`);
       stats[i].lastNonce = oldN;
     } else if (!sawAnyToLaunchTarget) {
-      warn(`(${label}) dev's tx wasn't to the pons factory OR the launchForwarder. Not a launch — paste the tx hash if you think it should be.`);
+      warn(`(${label}) dev's tx wasn't to factory OR forwarder — not a launch.`);
     }
   }
 
   httpClients.forEach((client, i) => {
     const label = `rpc#${i}(${stats[i].method})`;
     setInterval(async () => {
-      if (stats[i].method === "txpool") {
-        await pollTxpool(client, i, label);
-        return;
-      }
-      // Nonce-jump fallback for RPCs without txpool.
+      if (stats[i].method === "txpool") { await pollTxpool(client, i, label); return; }
       stats[i].pollN++;
       try {
         const nonce = await client.getTransactionCount({ address: devWallet, blockTag: "pending" });
@@ -546,10 +598,8 @@ async function main() {
     }, POLL_MS);
   });
 
-  ok(`watching wallet ${devWallet} across ${httpClients.length} HTTPS RPCs @ ${POLL_MS}ms`);
-  log(`(will print heartbeat every 5s; wakes up on any nonce jump)`);
+  ok(`watching wallet ${devWallet} across ${httpClients.length} HTTPS RPCs @ ${POLL_MS}ms  ·  ${activeWallets.length} active buyer wallet${activeWallets.length > 1 ? "s (fanout)" : ""}`);
 
-  // Heartbeat every 5s.
   setInterval(() => {
     const lines = stats.map((st, i) => {
       const url = new URL(rpcs[i]).host;
